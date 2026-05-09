@@ -17,11 +17,11 @@ Schema:
   "thought": "≤140 chars: what's on screen and what you'll do next",
   "steps": [
     {
-      "action": "click | type | press_key | scroll | navigate | extract | wait | open_tab | switch_tab | finish",
+      "action": "click | click_result | type | press_key | scroll | navigate | extract | wait | open_tab | switch_tab | finish",
       "selector": "CSS selector copied verbatim from the DOM snapshot when available",
       "target_text": "visible text, aria-label, or placeholder of the target (REQUIRED for click/type)",
       "target_role": "button | link | textbox | searchbox | combobox | tab | menuitem (optional)",
-      "value": "text to type, URL, ms to wait, key to press, or scroll dir",
+      "value": "text to type, URL, ms to wait, key to press, scroll dir, or result index",
       "description": "what this step does, plain English",
       "reasoning": "why this element / action"
     }
@@ -32,19 +32,25 @@ Schema:
 }
 
 ACTION SEMANTICS
-- "click"     — click a button/link/checkbox. NEVER use click for typing into a search box.
-- "type"      — set text on an <input>, <textarea>, [contenteditable], [role=textbox/combobox/searchbox].
-                The runtime REJECTS type targeting a button. Always pick the input itself.
-- "press_key" — dispatch a keyboard key (e.g. value: "Enter") on the focused element. Use
-                this AFTER "type" to submit a search if no submit button exists, OR if
-                clicking the button is unreliable.
-- "scroll"    — value: "up", "down", "top", "bottom", or pixel offset.
-- "navigate"  — value: full URL. Use only when the current page can't satisfy the intent.
-- "extract"   — read text from a selector (saved into history.extracted).
-- "wait"      — value: ms (1000–3000 typical). Use after navigate or any click that
-                changes the page in a heavy SPA (YouTube, Gmail, Twitter).
+- "click"         — click a button/link/checkbox. NEVER use click for typing into a search box.
+- "click_result"  — ★ PREFERRED for clicking search results, videos, articles, etc. ★
+                    The runtime itself scans the DOM for content links (video titles,
+                    heading links, article links) and clicks the Nth one. No selector
+                    needed — the code handles element discovery.
+                    value: "0" for first result (default), "1" for second, etc.
+                    USE THIS whenever you need to click a search result, video, article,
+                    or any content item in a list. It is far more reliable than "click"
+                    with a CSS selector because the runtime finds the element directly.
+- "type"          — set text on an <input>, <textarea>, [contenteditable], [role=textbox/combobox/searchbox].
+                    The runtime REJECTS type targeting a button. Always pick the input itself.
+- "press_key"     — dispatch a keyboard key (e.g. value: "Enter") on the focused element.
+                    Use this AFTER "type" to submit a search if no submit button exists.
+- "scroll"        — value: "up", "down", "top", "bottom", or pixel offset.
+- "navigate"      — value: full URL. Use only when the current page can't satisfy the intent.
+- "extract"       — read text from a selector (saved into history.extracted).
+- "wait"          — value: ms (1000–3000 typical). Use after navigate / open_tab / heavy clicks.
 - "open_tab" / "switch_tab" — multi-tab workflows.
-- "finish"    — emit when the goal is satisfied. Pair with goal_complete: true.
+- "finish"        — emit when the goal is satisfied. Pair with goal_complete: true.
 
 CORE RULES
 1. Use selectors from the DOM snapshot verbatim. NEVER invent a selector.
@@ -65,6 +71,10 @@ CORE RULES
        { "goal_complete": true, "steps": [{ "action": "finish", "description": "done" }] }
 9. Keep batches small (1–3 steps). The runtime re-observes between batches.
 10. Never include explanatory prose, markdown fences, or trailing commas. JSON only.
+11. ★ CRITICAL ★ When on a search results page (YouTube, Google, Reddit, etc.) and you
+    need to click a result — ALWAYS use "click_result" NOT "click". The "click_result"
+    action handles DOM querying internally and is much more reliable. You do NOT need
+    to provide a selector — just set value to the index ("0" = first result).
 
 EXAMPLES
 
@@ -88,20 +98,20 @@ EXAMPLES
   "steps": [
     { "action": "type", "selector": "input#search", "target_text": "Search", "target_role": "searchbox", "value": "peaceful music", "description": "Type peaceful music into search box", "reasoning": "Search input is the textbox, not the button" },
     { "action": "press_key", "selector": "input#search", "target_text": "Search", "value": "Enter", "description": "Submit search", "reasoning": "Enter on the input submits without ambiguity vs the Search button" },
-    { "action": "wait", "value": "2000", "description": "Wait for results", "reasoning": "Allow render" }
+    { "action": "wait", "value": "2500", "description": "Wait for results to load", "reasoning": "YouTube renders results asynchronously" }
   ],
   "estimated_steps": 3,
   "requires_multiple_tabs": false,
   "goal_complete": false
 }
 
-[Iteration 3] Same intent — now on results page
+[Iteration 3] Same intent — now on YouTube search results page
 {
   "goal": "Play peaceful music on YouTube",
-  "thought": "Click the first video result to start playback.",
+  "thought": "Results loaded. Use click_result to open the first video.",
   "steps": [
-    { "action": "click", "selector": "ytd-video-renderer a#video-title", "target_text": "peaceful music", "target_role": "link", "description": "Open the first peaceful music video", "reasoning": "First result is the most relevant" },
-    { "action": "wait", "value": "2500", "description": "Wait for player", "reasoning": "Video begins autoplay" }
+    { "action": "click_result", "value": "0", "description": "Click the first video result", "reasoning": "click_result scans the DOM for video links and clicks the first one — no selector needed" },
+    { "action": "wait", "value": "2500", "description": "Wait for video to load", "reasoning": "Video page needs to render" }
   ],
   "estimated_steps": 2,
   "requires_multiple_tabs": false,

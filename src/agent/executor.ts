@@ -33,6 +33,7 @@ export class Executor extends EventTarget {
   private paused = false;
   private stopped = false;
   private running = false;
+  private abortCtrl: AbortController | null = null;
 
   emit(event: AgentEvent): void {
     this.dispatchEvent(new CustomEvent<AgentEvent>('agent', { detail: event }));
@@ -56,21 +57,61 @@ export class Executor extends EventTarget {
   stop(): void {
     this.stopped = true;
     this.paused = false;
+    // Abort any in-flight sleeps, API calls, and DOM polling immediately.
+    if (this.abortCtrl) {
+      this.abortCtrl.abort();
+      this.abortCtrl = null;
+    }
     void clearPendingPlan();
+    // Emit done immediately so the UI updates without waiting for
+    // the runLoop to naturally exit.
+    if (this.running) {
+      this.running = false;
+      this.emit({
+        type: 'done',
+        message: 'Stopped by user.',
+        result: {
+          success: false,
+          steps_completed: 0,
+          steps_failed: 0,
+          summary: 'Stopped by user.',
+          errors: [],
+        },
+      });
+    }
   }
 
   isRunning(): boolean {
     return this.running;
   }
 
-  private async waitWhilePaused(): Promise<void> {
-    while (this.paused && !this.stopped) {
-      await new Promise((r) => setTimeout(r, 100));
-    }
+  /** Throws if the abort signal has fired. */
+  private throwIfStopped(): void {
+    if (this.stopped) throw new StopSignal();
   }
 
-  private async sleep(ms: number): Promise<void> {
-    await new Promise((r) => setTimeout(r, ms));
+  private async waitWhilePaused(): Promise<void> {
+    while (this.paused && !this.stopped) {
+      await this.sleep(100);
+    }
+    this.throwIfStopped();
+  }
+
+  /**
+   * Abortable sleep: resolves early if the abort signal fires.
+   * This is the key to making stop() feel instant.
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      if (this.stopped) { resolve(); return; }
+      const timer = setTimeout(resolve, ms);
+      const signal = this.abortCtrl?.signal;
+      if (signal) {
+        const onAbort = () => { clearTimeout(timer); resolve(); };
+        if (signal.aborted) { clearTimeout(timer); resolve(); return; }
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
   }
 
   /** Plan + run iteratively until goal_complete or max iterations. */
@@ -80,6 +121,7 @@ export class Executor extends EventTarget {
     this.running = true;
     this.paused = false;
     this.stopped = false;
+    this.abortCtrl = new AbortController();
 
     const state: RunState = {
       intent,
@@ -100,6 +142,7 @@ export class Executor extends EventTarget {
     this.running = true;
     this.paused = false;
     this.stopped = false;
+    this.abortCtrl = new AbortController();
 
     const history = (pending as PendingPlan & { history?: StepRecord[] }).history ?? [];
     const state: RunState = {
@@ -127,25 +170,29 @@ export class Executor extends EventTarget {
 
     try {
       while (iteration < MAX_ITERATIONS) {
-        if (this.stopped) break;
+        this.throwIfStopped();
         await this.waitWhilePaused();
-        if (this.stopped) break;
+        this.throwIfStopped();
 
         // 1. Observe — fresh DOM snapshot.
         await this.sleep(150);
+        this.throwIfStopped();
         const dom = analyzeDom();
         const profile = await loadProfile();
 
         // 2. Think — ask Gemini for next batch.
         let plan: ExecutionPlan;
         try {
+          this.throwIfStopped();
           plan = await generateExecutionPlan(
             state.intent,
             dom,
             profile,
             state.history.slice(-MAX_HISTORY),
           );
+          this.throwIfStopped();
         } catch (err) {
+          if (err instanceof StopSignal) throw err;
           const msg = (err as Error).message;
           state.errors.push(`Planning: ${msg}`);
           const result: ExecutionResult = {
@@ -189,7 +236,9 @@ export class Executor extends EventTarget {
         iteration += 1;
 
         if (navigated) {
-          // Persist and bail; resume on next page load.
+          // Save a safety-net plan in case this is a full-page navigation
+          // (which kills the JS context). The new page's content script
+          // will pick it up and resume.
           await savePendingPlan({
             intent: state.intent,
             plan: { ...plan, goal: state.goal },
@@ -198,19 +247,27 @@ export class Executor extends EventTarget {
             stored_at: Date.now(),
             history: state.history.slice(-MAX_HISTORY),
           } as PendingPlan & { history: StepRecord[] });
+
           this.emit({
             type: 'log',
-            message: 'Navigation detected — pausing; will resume on next page.',
+            message: 'Navigation detected — waiting for page to settle…',
           });
-          await this.sleep(200);
-          this.running = false;
-          return {
-            success: false,
-            steps_completed: state.completedSteps,
-            steps_failed: state.failedSteps,
-            summary: 'Navigating — plan will resume after page load.',
-            errors: state.errors,
-          };
+
+          // Wait for the page to settle. If this is a full-page navigation,
+          // the JS context dies here and the new page resumes from the saved
+          // plan. If it's a SPA navigation (YouTube, Gmail, Twitter, etc.),
+          // we survive this wait and continue the loop with a fresh snapshot.
+          await this.sleep(2500);
+
+          // Still alive → SPA navigation. Clear the safety-net plan and
+          // continue the observe → think → act loop.
+          await clearPendingPlan();
+          this.emit({
+            type: 'log',
+            message: 'SPA navigation — continuing with fresh page state.',
+          });
+          // Don't increment iteration again — the loop will re-snapshot.
+          continue;
         }
       }
 
@@ -229,10 +286,24 @@ export class Executor extends EventTarget {
       };
 
       await clearPendingPlan();
-      this.emit({ type: 'done', result, message: result.summary });
+      // Only emit if stop() hasn't already emitted done
+      if (!this.stopped) {
+        this.emit({ type: 'done', result, message: result.summary });
+      }
       this.running = false;
       return result;
     } catch (err) {
+      // StopSignal is not an error — it's an expected interruption.
+      if (err instanceof StopSignal) {
+        this.running = false;
+        return {
+          success: false,
+          steps_completed: state.completedSteps,
+          steps_failed: state.failedSteps,
+          summary: `Stopped after ${state.completedSteps} step(s).`,
+          errors: state.errors,
+        };
+      }
       const msg = (err as Error).message;
       state.errors.push(msg);
       const result: ExecutionResult = {
@@ -252,9 +323,9 @@ export class Executor extends EventTarget {
   /** Run a small batch of steps. Returns true if a navigation occurred. */
   private async runBatch(state: RunState, steps: AgentAction[]): Promise<boolean> {
     for (let i = 0; i < steps.length; i++) {
-      if (this.stopped) return false;
+      this.throwIfStopped();
       await this.waitWhilePaused();
-      if (this.stopped) return false;
+      this.throwIfStopped();
 
       const step = steps[i];
 
@@ -270,6 +341,7 @@ export class Executor extends EventTarget {
       });
 
       const outcome = await this.executeStepWithRetry(step);
+      this.throwIfStopped();
       const urlAfter = location.href;
 
       if (outcome.error) {
@@ -321,6 +393,7 @@ export class Executor extends EventTarget {
     extracted?: string;
   }> {
     try {
+      this.throwIfStopped();
       const r = await runAction(step);
       return {
         error: null,
@@ -329,8 +402,11 @@ export class Executor extends EventTarget {
         extracted: r.extracted,
       };
     } catch (firstErr) {
+      if (firstErr instanceof StopSignal) throw firstErr;
+      if (this.stopped) throw new StopSignal();
       const firstMessage = (firstErr as Error).message;
       await this.sleep(400);
+      if (this.stopped) throw new StopSignal();
       try {
         const r = await runAction(step);
         return {
@@ -340,11 +416,18 @@ export class Executor extends EventTarget {
           extracted: r.extracted,
         };
       } catch (secondErr) {
+        if (secondErr instanceof StopSignal) throw secondErr;
+        if (this.stopped) throw new StopSignal();
         const secondMessage = (secondErr as Error).message;
         return { error: `${firstMessage} | retry: ${secondMessage}` };
       }
     }
   }
+}
+
+/** Sentinel thrown when the user presses Stop. Not an error. */
+class StopSignal {
+  readonly message = 'Stopped by user.';
 }
 
 function failResult(summary: string, errors: string[] = []): ExecutionResult {

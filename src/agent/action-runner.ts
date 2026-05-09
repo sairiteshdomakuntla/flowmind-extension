@@ -16,6 +16,8 @@ export async function runAction(action: AgentAction): Promise<RunActionResult> {
   switch (action.action) {
     case 'click':
       return await doClick(action);
+    case 'click_result':
+      return await doClickResult(action);
     case 'type':
       return await doType(action);
     case 'press_key':
@@ -70,9 +72,66 @@ async function doPressKey(action: AgentAction): Promise<RunActionResult> {
         /* ignore */
       }
     }
+    // SPA search boxes (e.g. YouTube) often have no <form> ancestor and
+    // rely on a sibling "search" button. If pressing Enter didn't change
+    // the URL within a short window, click the nearest visible search
+    // submit control we can find by aria-label / role.
+    await sleep(250);
+    if (location.href === before) {
+      const submit = findNearbySearchSubmit(el);
+      if (submit) {
+        await scrollIntoView(submit);
+        fireMouseSequence(submit);
+      }
+    }
   }
   await sleep(150);
   return { resolved_selector: el instanceof HTMLElement ? describe(el) : undefined, navigated: location.href !== before };
+}
+
+/**
+ * Find a search-submit button near (or globally adjacent to) the given input.
+ * Looks for buttons whose accessible name is "search" / "submit search" or
+ * which carry a search icon, without hard-coding any site-specific IDs.
+ */
+function findNearbySearchSubmit(input: HTMLElement): HTMLElement | null {
+  const candidates: HTMLElement[] = [];
+
+  // 1. Walk up a few ancestors and grab buttons that look like search submit.
+  let cursor: HTMLElement | null = input;
+  for (let i = 0; cursor && i < 5; i++) {
+    cursor = cursor.parentElement;
+    if (!cursor) break;
+    cursor
+      .querySelectorAll<HTMLElement>('button, [role="button"], input[type="submit"]')
+      .forEach((b) => candidates.push(b));
+  }
+
+  // 2. Page-wide fallback (covers YouTube where the button lives outside the input's parent chain).
+  document
+    .querySelectorAll<HTMLElement>(
+      'button[aria-label*="earch" i], [role="button"][aria-label*="earch" i], button[id*="search" i], [class*="search-icon" i]',
+    )
+    .forEach((b) => candidates.push(b));
+
+  for (const el of candidates) {
+    if (el === input) continue;
+    if (!isInteractable(el)) continue;
+    const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+    const title = (el.getAttribute('title') || '').toLowerCase();
+    const id = (el.id || '').toLowerCase();
+    const text = (el.textContent || '').trim().toLowerCase();
+    if (
+      aria.includes('search') ||
+      title.includes('search') ||
+      id.includes('search') ||
+      text === 'search' ||
+      el.matches('input[type="submit"]')
+    ) {
+      return el;
+    }
+  }
+  return null;
 }
 
 /* ─── click ─────────────────────────────────────────────────────── */
@@ -83,12 +142,216 @@ async function doClick(action: AgentAction): Promise<RunActionResult> {
   await sleep(60);
   const before = location.href;
   fireMouseSequence(el);
-  await sleep(120);
+  // Give the SPA router time to respond (YouTube intercepts anchor clicks).
+  await sleep(300);
   const navigated = location.href !== before;
+
+  // Fallback: if no navigation happened and the element is an anchor with href,
+  // drive the navigation ourselves. This reliably handles YouTube's custom-element
+  // shadow DOM where synthetic mouse events may not reach the router.
+  if (!navigated && el instanceof HTMLAnchorElement) {
+    const href = el.getAttribute('href');
+    if (href) {
+      const absolute = href.startsWith('http') ? href : location.origin + href;
+      location.assign(absolute);
+      await sleep(100);
+      return { resolved_selector: describe(el), navigated: true };
+    }
+  }
+
   return { resolved_selector: describe(el), navigated };
 }
 
-/* ─── type ──────────────────────────────────────────────────────── */
+/* ─── click_result (deterministic, no LLM selector) ───────────── */
+
+/**
+ * Directly scan the live DOM for content/video/article links and navigate
+ * to the Nth one (value = index, default "0"). This bypasses LLM selectors
+ * entirely — the code itself finds the right anchor and uses its href.
+ *
+ * Link discovery cascade (site-agnostic, checked in order):
+ *   1. a[id="video-title"]       — YouTube search/home video results
+ *   2. a[id="video-title-link"]  — YouTube playlist items
+ *   3. ytd-video-renderer a[href*="/watch"] — YouTube fallback
+ *   4. h3 a[href]                — Google, Reddit, HN, generic results
+ *   5. h2 a[href]                — alternative heading-link pattern
+ *   6. [data-video-id] a[href]   — YouTube embedded players
+ *   7. a[href*="/watch?v="]      — catch-all for YouTube watch links
+ *   8. article a[href]           — blog / news article lists
+ */
+async function doClickResult(action: AgentAction): Promise<RunActionResult> {
+  const targetIndex = Math.max(0, parseInt(action.value ?? '0', 10) || 0);
+
+  // Wait a moment for any lazy-loading/rendering to settle
+  await sleep(500);
+
+  const link = findNthContentLink(targetIndex);
+  if (!link) {
+    throw new Error(
+      `click_result: no content/video link found at index ${targetIndex}. ` +
+      `The page may still be loading or has no results.`
+    );
+  }
+
+  const href = link.getAttribute('href');
+  if (!href) {
+    throw new Error(`click_result: found link but it has no href attribute.`);
+  }
+
+  const title = (link.textContent || link.getAttribute('title') || '').trim();
+  const selector = describe(link);
+
+  // Scroll into view for visual feedback
+  await scrollIntoView(link);
+  await sleep(100);
+
+  const before = location.href;
+
+  // Strategy 1: Try native .click() — SPA routers (YouTube, Gmail, etc.)
+  // intercept this and perform a smooth in-app navigation. This is the
+  // best UX because it avoids a full page reload.
+  link.click();
+  await sleep(400);
+
+  if (location.href !== before) {
+    return {
+      resolved_selector: selector,
+      navigated: true,
+      extracted: title ? `Clicked: ${title.slice(0, 120)}` : undefined,
+    };
+  }
+
+  // Strategy 2: Try synthetic mouse event sequence
+  fireMouseSequence(link);
+  await sleep(400);
+
+  if (location.href !== before) {
+    return {
+      resolved_selector: selector,
+      navigated: true,
+      extracted: title ? `Clicked: ${title.slice(0, 120)}` : undefined,
+    };
+  }
+
+  // Strategy 3: Direct navigation via href — always works as last resort
+  const absolute = href.startsWith('http') ? href : location.origin + href;
+  location.assign(absolute);
+
+  return {
+    resolved_selector: selector,
+    navigated: true,
+    extracted: title ? `Clicked: ${title.slice(0, 120)}` : undefined,
+  };
+}
+
+/**
+ * Find the Nth visible content link on the page using a priority cascade
+ * of selectors. Each selector targets a common pattern for "result items"
+ * across major sites. Site-agnostic: no hard-coded IDs or class names
+ * beyond well-known semantic patterns.
+ */
+function findNthContentLink(n: number): HTMLAnchorElement | null {
+  // Each group is tried in order. Within a group, we collect all visible
+  // anchors with hrefs. If any group yields enough results, we pick from it.
+  const selectorGroups = [
+    // YouTube video title links (highest priority — exact match)
+    'a#video-title, a#video-title-link',
+    // YouTube fallback: any watch link inside a video renderer
+    'ytd-video-renderer a[href*="/watch"], ytd-rich-item-renderer a[href*="/watch"]',
+    // Google search / generic heading links
+    'h3 a[href]',
+    // Alternative heading links
+    'h2 a[href], h1 a[href]',
+    // YouTube catch-all watch links (but not in sidebar/nav)
+    'a[href*="/watch?v="]',
+    // Article/card patterns
+    'article a[href], [role="article"] a[href]',
+  ];
+
+  const seenHrefs = new Set<string>();
+
+  for (const selector of selectorGroups) {
+    const links: HTMLAnchorElement[] = [];
+    try {
+      document.querySelectorAll<HTMLAnchorElement>(selector).forEach((a) => {
+        const href = a.getAttribute('href');
+        if (!href) return;
+        // Skip duplicates (same href via different selectors)
+        if (seenHrefs.has(href)) return;
+        // Skip non-content links (navbars, footers, etc.)
+        if (isNavOrFooterLink(a)) return;
+        // Must be visible (allow slightly off-screen for lazy-loaded content)
+        if (!isLinkVisible(a)) return;
+        seenHrefs.add(href);
+        links.push(a);
+      });
+    } catch {
+      continue;
+    }
+
+    if (links.length > n) {
+      return links[n];
+    }
+    // If this group has some links but not enough, still try next group
+    // to see if a broader selector finds more
+  }
+
+  // Final fallback: collect ALL links found across all groups
+  // and return the nth one if available
+  const allLinks: HTMLAnchorElement[] = [];
+  const allSeenHrefs = new Set<string>();
+  for (const selector of selectorGroups) {
+    try {
+      document.querySelectorAll<HTMLAnchorElement>(selector).forEach((a) => {
+        const href = a.getAttribute('href');
+        if (!href || allSeenHrefs.has(href)) return;
+        if (isNavOrFooterLink(a)) return;
+        if (!isLinkVisible(a)) return;
+        allSeenHrefs.add(href);
+        allLinks.push(a);
+      });
+    } catch {
+      continue;
+    }
+  }
+
+  return allLinks[n] ?? null;
+}
+
+/** Check if a link is inside a nav, header, footer, or sidebar — skip these. */
+function isNavOrFooterLink(el: HTMLElement): boolean {
+  let cursor: HTMLElement | null = el;
+  for (let i = 0; cursor && i < 8; i++) {
+    const tag = cursor.tagName.toLowerCase();
+    const role = cursor.getAttribute('role') || '';
+    if (
+      tag === 'nav' || tag === 'footer' || tag === 'header' ||
+      role === 'navigation' || role === 'banner' || role === 'contentinfo'
+    ) {
+      return true;
+    }
+    // YouTube's sidebar suggestions
+    const id = (cursor.id || '').toLowerCase();
+    if (id === 'secondary' || id === 'guide' || id === 'masthead-container') {
+      return true;
+    }
+    cursor = cursor.parentElement;
+  }
+  return false;
+}
+
+/** Check if a link is visible enough to be a real content link. */
+function isLinkVisible(el: HTMLElement): boolean {
+  const style = window.getComputedStyle(el);
+  if (style.display === 'none' || style.visibility === 'hidden') return false;
+  if (Number(style.opacity) === 0) return false;
+  const r = el.getBoundingClientRect();
+  if (r.width === 0 || r.height === 0) return false;
+  // Allow links up to 1500px below viewport (lazy-loaded results)
+  if (r.top > window.innerHeight + 1500) return false;
+  return true;
+}
+
 
 async function doType(action: AgentAction): Promise<RunActionResult> {
   const el = await resolveElement(action);
@@ -253,6 +516,11 @@ function findElement(action: AgentAction): Element | null {
     if (fromSelector) return fromSelector;
   }
   if (action.target_text) {
+    // For click actions, also search media/content links (video titles, etc.)
+    if (action.action === 'click') {
+      const mediaLink = findMediaLink(action.target_text);
+      if (mediaLink) return mediaLink;
+    }
     const byText = findByText(action.target_text, action.target_role);
     if (byText) return byText;
   }
@@ -374,7 +642,51 @@ function isInteractable(el: Element): boolean {
   if (Number(style.opacity) === 0) return false;
   const r = el.getBoundingClientRect();
   if (r.width === 0 || r.height === 0) return false;
+  // Allow elements up to 600px below the visible viewport (lazy-loaded results)
+  const vh = window.innerHeight + 600;
+  if (r.bottom < -300 || r.top > vh) return false;
   return true;
+}
+
+/**
+ * Find a media/content link (video title, article heading, etc.) whose text
+ * contains the needle. Works generically across YouTube, Reddit, HN, etc.
+ * Searches:
+ *   1. a[id="video-title"] — YouTube search/home results
+ *   2. a[id="video-title-link"] — YouTube playlists
+ *   3. h1/h2/h3/h4 > a[href] — generic heading links
+ * Falls back to the first result if no text match found.
+ */
+function findMediaLink(needleRaw: string): HTMLAnchorElement | null {
+  const needle = needleRaw.trim().toLowerCase();
+
+  const candidates = Array.from(
+    document.querySelectorAll<HTMLAnchorElement>(
+      'a[id="video-title"], a[id="video-title-link"], h1 a[href], h2 a[href], h3 a[href], h4 a[href]',
+    ),
+  );
+
+  if (candidates.length === 0) return null;
+
+  // Exact text match first
+  for (const a of candidates) {
+    const text = (a.textContent || a.getAttribute('title') || '').trim().toLowerCase();
+    if (text === needle && isInteractable(a)) return a;
+  }
+  // Contains match
+  for (const a of candidates) {
+    const text = (a.textContent || a.getAttribute('title') || '').trim().toLowerCase();
+    if (text.includes(needle) && isInteractable(a)) return a;
+  }
+  // Needle is in the href (e.g. video ID or slug)
+  for (const a of candidates) {
+    if ((a.getAttribute('href') || '').includes(needle) && isInteractable(a)) return a;
+  }
+  // Last resort: return the first interactable candidate (most relevant result)
+  for (const a of candidates) {
+    if (isInteractable(a)) return a;
+  }
+  return null;
 }
 
 /* ─── helpers ───────────────────────────────────────────────────── */

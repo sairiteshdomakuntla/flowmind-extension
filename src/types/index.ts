@@ -1,5 +1,6 @@
 export type ActionType =
   | 'click'
+  | 'click_result'
   | 'type'
   | 'press_key'
   | 'scroll'
@@ -65,6 +66,13 @@ export interface DOMSnapshot {
     visible: boolean;
   }[];
   page_text_summary: string;
+  /**
+   * Extracted content/media links (video titles, article headings, etc.).
+   * Populated by the DOM analyzer when it detects results pages.
+   * Gives the agent a reliable list to click even if the interactive_elements
+   * cap truncated them.
+   */
+  media_links?: { title: string; href: string; selector: string }[];
 }
 
 export interface UserProfile {

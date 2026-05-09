@@ -2,9 +2,9 @@ import type { DOMSnapshot } from '../types';
 
 const PAGE_TEXT_LIMIT = 2000;
 const INTERACTIVE_SELECTOR =
-  'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="combobox"], [contenteditable="true"]';
+  'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="combobox"], [contenteditable="true"], [id="video-title"], h3 a[href]';
 
-export function isVisible(el: Element): boolean {
+export function isVisible(el: Element, allowOffscreen = false): boolean {
   if (!(el instanceof HTMLElement)) return false;
   const style = window.getComputedStyle(el);
   if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
@@ -12,6 +12,12 @@ export function isVisible(el: Element): boolean {
   }
   const rect = el.getBoundingClientRect();
   if (rect.width === 0 || rect.height === 0) return false;
+  // Allow elements slightly outside the viewport (e.g. lazy-loaded YouTube results)
+  if (!allowOffscreen) {
+    const vh = window.innerHeight + 500;
+    const vw = window.innerWidth + 200;
+    if (rect.bottom < -200 || rect.top > vh || rect.right < -200 || rect.left > vw) return false;
+  }
   return true;
 }
 
@@ -152,17 +158,59 @@ export function analyzeDom(): DOMSnapshot {
   const MAX_ELEMENTS = 120;
   if (interactive_elements.length > MAX_ELEMENTS) {
     interactive_elements.sort((a, b) => {
-      const aScore = (a.aria_label ? 2 : 0) + (a.text ? 1 : 0) + (a.id ? 1 : 0);
-      const bScore = (b.aria_label ? 2 : 0) + (b.text ? 1 : 0) + (b.id ? 1 : 0);
+      // Boost video/media links so they survive the cap
+      const aIsMedia = a.tag === 'a' && (a.id === 'video-title' || (a.selector || '').includes('video-title'));
+      const bIsMedia = b.tag === 'a' && (b.id === 'video-title' || (b.selector || '').includes('video-title'));
+      const aScore = (aIsMedia ? 5 : 0) + (a.aria_label ? 2 : 0) + (a.text ? 1 : 0) + (a.id ? 1 : 0);
+      const bScore = (bIsMedia ? 5 : 0) + (b.aria_label ? 2 : 0) + (b.text ? 1 : 0) + (b.id ? 1 : 0);
       return bScore - aScore;
     });
     interactive_elements.length = MAX_ELEMENTS;
   }
+
+  // Extract media/video links separately so Gemini always sees them regardless of the cap.
+  const media_links = extractMediaLinks();
 
   return {
     url: location.href,
     title: document.title,
     interactive_elements,
     page_text_summary: extractPageText(),
+    media_links: media_links.length > 0 ? media_links : undefined,
   };
+}
+
+/**
+ * Extract the first N visible video/article title links from the page.
+ * Works generically: looks for <a> elements inside heading tags or with
+ * id/aria attributes that suggest they are content titles (video, article, etc.).
+ * This is site-agnostic and will work on YouTube, Reddit, HN, etc.
+ */
+function extractMediaLinks(): { title: string; href: string; selector: string }[] {
+  const results: { title: string; href: string; selector: string }[] = [];
+  const seen = new Set<string>();
+
+  // Strategy 1: <a id="video-title"> (YouTube search results)
+  document.querySelectorAll<HTMLAnchorElement>('a[id="video-title"], a[id="video-title-link"]').forEach((a) => {
+    const text = (a.textContent || a.getAttribute('title') || '').trim().replace(/\s+/g, ' ');
+    const href = a.getAttribute('href') || '';
+    if (!text || !href || seen.has(href)) return;
+    if (!isVisible(a, true)) return;
+    seen.add(href);
+    results.push({ title: text.slice(0, 120), href, selector: generateSelector(a) });
+  });
+
+  // Strategy 2: <h3><a href> or <h2><a href> — generic heading links (works on most sites)
+  if (results.length === 0) {
+    document.querySelectorAll<HTMLAnchorElement>('h1 a[href], h2 a[href], h3 a[href], h4 a[href]').forEach((a) => {
+      const text = (a.textContent || '').trim().replace(/\s+/g, ' ');
+      const href = a.getAttribute('href') || '';
+      if (!text || !href || seen.has(href)) return;
+      if (!isVisible(a, true)) return;
+      seen.add(href);
+      results.push({ title: text.slice(0, 120), href, selector: generateSelector(a) });
+    });
+  }
+
+  return results.slice(0, 10);
 }

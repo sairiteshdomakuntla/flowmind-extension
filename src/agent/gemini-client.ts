@@ -82,12 +82,20 @@ ${history
 
 `
     : '';
+  const mediaLinksBlock = dom.media_links && dom.media_links.length > 0
+    ? `=== CONTENT/VIDEO LINKS ON THIS PAGE (media_links) ===
+Use these verbatim when you need to click a result. Prefer media_links[0] for the first result.
+${dom.media_links.map((ml, i) => `[${i}] title="${ml.title}" selector="${ml.selector}" href="${ml.href}"`).join('\n')}
+
+`
+    : '';
+
   return `${AGENT_SYSTEM_PROMPT}
 
 === USER PROFILE ===
 ${profileContext}
 
-${historyBlock}=== CURRENT PAGE ===
+${historyBlock}${mediaLinksBlock}=== CURRENT PAGE ===
 URL: ${dom.url}
 Title: ${dom.title}
 

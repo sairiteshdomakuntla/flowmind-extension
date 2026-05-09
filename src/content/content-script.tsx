@@ -9,18 +9,49 @@ import { executor, loadPendingPlan, clearPendingPlan } from '../agent/executor';
 import { savePastCommand, getPastCommands } from '../memory/storage';
 import type { AgentEvent } from '../types';
 
-import './content.css';
+// Tailwind output, imported as a raw string so we can inject it into a
+// Shadow DOM root and keep its `@tailwind base` (Preflight) reset from
+// leaking into the host page.
+import contentCss from './content.css?inline';
 
-const ROOT_ID = 'flowmind-root';
+const HOST_ID = 'flowmind-shadow-host';
 
-function ensureRoot(): HTMLElement {
-  let root = document.getElementById(ROOT_ID);
-  if (!root) {
-    root = document.createElement('div');
-    root.id = ROOT_ID;
-    document.documentElement.appendChild(root);
+interface MountTarget {
+  /** Container element actually rendered into (lives inside the shadow root). */
+  container: HTMLElement;
+  /** The shadow root, exposed for components that need a non-document scope. */
+  shadowRoot: ShadowRoot;
+}
+
+function ensureRoot(): MountTarget {
+  let host = document.getElementById(HOST_ID) as HTMLElement | null;
+  if (host && host.shadowRoot) {
+    const inner = host.shadowRoot.getElementById('flowmind-root') as HTMLElement | null;
+    if (inner) return { container: inner, shadowRoot: host.shadowRoot };
   }
-  return root;
+
+  if (!host) {
+    host = document.createElement('div');
+    host.id = HOST_ID;
+    // Neutralize any host-page styles targeting our host element. The shadow
+    // tree owns its own visuals; the host is just an anchor.
+    host.style.all = 'initial';
+    host.style.position = 'static';
+    document.documentElement.appendChild(host);
+  }
+
+  const shadow = host.shadowRoot ?? host.attachShadow({ mode: 'open' });
+
+  // Inject Tailwind + component CSS scoped to this shadow root only.
+  const style = document.createElement('style');
+  style.textContent = contentCss;
+  shadow.appendChild(style);
+
+  const inner = document.createElement('div');
+  inner.id = 'flowmind-root';
+  shadow.appendChild(inner);
+
+  return { container: inner, shadowRoot: shadow };
 }
 
 type IntentBoxEvent = Event & { detail?: { open?: boolean } };
@@ -172,7 +203,7 @@ function App() {
 let root: Root | null = null;
 
 function mount() {
-  const container = ensureRoot();
+  const { container } = ensureRoot();
   if (root) return;
   root = createRoot(container);
   root.render(
