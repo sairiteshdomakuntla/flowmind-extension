@@ -6,7 +6,7 @@ Autonomous browser agent — a Chrome MV3 extension powered by Google Gemini 1.5
 - Manifest V3 Chrome extension
 - React 18 + TypeScript + Vite + `@crxjs/vite-plugin`
 - Tailwind CSS
-- Gemini 1.5 Flash (free tier)
+- Gemini 2.5 Flash
 
 ## Setup
 
