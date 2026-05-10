@@ -1,12 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
+import { FlowMark } from './brand/FlowMark';
+import { IconArrow, IconAlert, IconClose } from './brand/Icon';
+import type { WorkflowMemory } from '../types';
 
 interface IntentBoxProps {
   open: boolean;
   loading?: boolean;
   error?: string | null;
   recentCommands?: string[];
-  onSubmit?: (intent: string) => void;
+  onSubmit?: (intent: string, opts?: { replayWorkflow?: WorkflowMemory }) => void;
   onClose?: () => void;
+  /** Resolved against the current input text via workflow-store.matchByIntent. */
+  onIntentChange?: (intent: string) => void;
+  matchedWorkflow?: WorkflowMemory | null;
 }
 
 export function IntentBox({
@@ -16,6 +22,8 @@ export function IntentBox({
   recentCommands = [],
   onSubmit,
   onClose,
+  onIntentChange,
+  matchedWorkflow,
 }: IntentBoxProps) {
   const [value, setValue] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
@@ -23,11 +31,20 @@ export function IntentBox({
   const loadingRef = useRef(loading);
   const onSubmitRef = useRef(onSubmit);
   const onCloseRef = useRef(onClose);
+  const matchedRef = useRef(matchedWorkflow);
 
   valueRef.current = value;
   loadingRef.current = loading;
   onSubmitRef.current = onSubmit;
   onCloseRef.current = onClose;
+  matchedRef.current = matchedWorkflow;
+
+  // Debounced intent-change notifier so the parent can run matchByIntent.
+  useEffect(() => {
+    if (!onIntentChange) return undefined;
+    const handle = window.setTimeout(() => onIntentChange(value), 200);
+    return () => window.clearTimeout(handle);
+  }, [value, onIntentChange]);
 
   useEffect(() => {
     if (open) {
@@ -38,8 +55,8 @@ export function IntentBox({
     return undefined;
   }, [open]);
 
-  // Capture-phase native listener so we win the race against host pages
-  // (YouTube, Gmail, etc.) that hijack Enter/Esc with their own listeners.
+  // Capture-phase listener so we beat host pages (YouTube, Gmail) that
+  // hijack Enter/Esc with their own handlers.
   useEffect(() => {
     if (!open) return undefined;
     function handler(e: KeyboardEvent) {
@@ -66,16 +83,20 @@ export function IntentBox({
 
   if (!open) return null;
 
-  function submit() {
+  function submit(replay = false) {
     const text = value.trim();
     if (!text || loading) return;
-    onSubmit?.(text);
+    onSubmit?.(text, replay && matchedRef.current ? { replayWorkflow: matchedRef.current } : undefined);
   }
 
   return (
     <div
-      className="fixed inset-0 z-[2147483647] flex items-start justify-center pt-28"
-      style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)' }}
+      className="fixed inset-0 z-[2147483647] flex items-start justify-center pt-[18vh] font-sans animate-fm-fade"
+      style={{
+        background: 'rgba(6,6,12,0.55)',
+        backdropFilter: 'blur(18px) saturate(140%)',
+        WebkitBackdropFilter: 'blur(18px) saturate(140%)',
+      }}
       onMouseDown={(e) => {
         if (e.target === e.currentTarget && !loading) onClose?.();
       }}
@@ -83,88 +104,170 @@ export function IntentBox({
       onKeyUpCapture={(e) => e.stopPropagation()}
     >
       <div
-        className="w-[620px] max-w-[90vw] overflow-hidden rounded-2xl animate-slide-up"
+        className="w-[640px] max-w-[92vw] overflow-hidden rounded-panel animate-fm-lift"
         style={{
-          background: 'linear-gradient(180deg, #1a1728 0%, #13111f 100%)',
-          border: '1px solid rgba(139,92,246,0.25)',
-          boxShadow: '0 0 0 1px rgba(139,92,246,0.1), 0 20px 60px rgba(0,0,0,0.7), 0 0 40px rgba(124,58,237,0.15)',
+          background:
+            'linear-gradient(180deg, rgba(15,15,26,0.96) 0%, rgba(8,8,15,0.96) 100%)',
+          border: '1px solid rgba(255,255,255,0.07)',
+          boxShadow:
+            '0 30px 80px -20px rgba(0,0,0,0.65), 0 1px 0 0 rgba(255,255,255,0.05) inset',
         }}
         onMouseDown={(e) => e.stopPropagation()}
       >
-        {/* Top accent line */}
-        <div className="h-px w-full" style={{ background: 'linear-gradient(90deg, transparent, rgba(139,92,246,0.6), transparent)' }} />
+        {/* Hairline accent at top */}
+        <div
+          className="h-px w-full"
+          style={{
+            background:
+              'linear-gradient(90deg, transparent 0%, rgba(124,92,255,0.55) 50%, transparent 100%)',
+          }}
+        />
 
         {/* Input row */}
         <div className="flex items-center gap-3 px-5 py-4">
-          {/* Brand mark */}
           <div
-            className="flex h-7 w-7 flex-none items-center justify-center rounded-lg text-xs font-bold"
-            style={{ background: 'linear-gradient(135deg, #7c3aed, #4f46e5)', boxShadow: '0 0 10px rgba(124,58,237,0.4)' }}
+            className="flex h-9 w-9 flex-none items-center justify-center rounded-ctrl"
+            style={{
+              background: 'rgba(124,92,255,0.08)',
+              border: '1px solid rgba(124,92,255,0.18)',
+            }}
           >
-            <svg viewBox="0 0 16 16" fill="none" className="h-4 w-4" stroke="white" strokeWidth="1.5">
-              <circle cx="8" cy="8" r="3" />
-              <path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.22 3.22l1.42 1.42M11.36 11.36l1.42 1.42M3.22 12.78l1.42-1.42M11.36 4.64l1.42-1.42" strokeLinecap="round" />
-            </svg>
+            <FlowMark size={18} />
           </div>
 
-          <div className="relative flex-1">
-            <input
-              ref={inputRef}
-              autoFocus
-              disabled={loading}
-              className="w-full bg-transparent text-base font-medium text-gray-100 placeholder-gray-600 outline-none disabled:opacity-60"
-              placeholder={loading ? 'Generating plan…' : 'What should FlowMind do?'}
-              value={value}
-              onChange={(e) => setValue(e.target.value)}
-            />
-          </div>
+          <input
+            ref={inputRef}
+            autoFocus
+            disabled={loading}
+            className="flex-1 bg-transparent text-[15px] font-medium tracking-display text-fg-0 placeholder-fg-300 outline-none disabled:opacity-60"
+            placeholder={
+              loading ? 'Composing plan…' : 'Tell FlowMind what to do'
+            }
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            spellCheck={false}
+            autoComplete="off"
+          />
 
           {loading ? (
             <Spinner />
           ) : (
             <button
               type="button"
-              onClick={submit}
+              onClick={() => submit(false)}
               disabled={!value.trim()}
-              className="flex-none rounded-lg px-3 py-1.5 text-xs font-semibold text-white transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-40"
-              style={{ background: 'linear-gradient(135deg, #7c3aed, #4f46e5)', boxShadow: '0 0 10px rgba(124,58,237,0.3)' }}
+              className="flex flex-none items-center gap-1.5 rounded-ctrl px-3 py-[7px] text-[11px] font-semibold tracking-display text-fg-0 transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-30"
+              style={{
+                background: value.trim()
+                  ? 'linear-gradient(135deg, #7C5CFF 0%, #4FA3FF 100%)'
+                  : 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.08)',
+              }}
             >
-              ↵ Run
+              Run
+              <IconArrow size={12} />
             </button>
           )}
+
+          <button
+            type="button"
+            aria-label="Close"
+            onClick={() => !loading && onClose?.()}
+            className="flex h-7 w-7 flex-none items-center justify-center rounded-ctrl text-fg-300 transition-colors duration-150 hover:text-fg-50 disabled:opacity-30"
+            disabled={loading}
+            style={{ background: 'transparent' }}
+          >
+            <IconClose size={14} />
+          </button>
         </div>
+
+        {/* Matched workflow banner */}
+        {matchedWorkflow && !loading && (
+          <div
+            className="flex items-center gap-3 px-5 py-2.5 text-[12px] animate-fm-fade"
+            style={{
+              background: 'rgba(124,92,255,0.07)',
+              borderTop: '1px solid rgba(124,92,255,0.18)',
+            }}
+          >
+            <span className="text-fg-200">
+              I&apos;ve done this before — {matchedWorkflow.actions.length} step
+              {matchedWorkflow.actions.length === 1 ? '' : 's'}
+              {matchedWorkflow.run_count > 0 && (
+                <span className="text-fg-400">
+                  {' · '}
+                  {Math.round(matchedWorkflow.success_rate * 100)}% success
+                </span>
+              )}
+            </span>
+            <span className="flex-1" />
+            <button
+              type="button"
+              onClick={() => submit(true)}
+              className="rounded-ctrl px-2.5 py-1 text-[11px] font-semibold tracking-display text-fg-0"
+              style={{
+                background: 'linear-gradient(135deg, #7C5CFF 0%, #4FA3FF 100%)',
+                border: '1px solid rgba(255,255,255,0.08)',
+              }}
+            >
+              Replay
+            </button>
+            <button
+              type="button"
+              onClick={() => submit(false)}
+              className="rounded-ctrl px-2.5 py-1 text-[11px] font-semibold tracking-display text-fg-200"
+              style={{
+                background: 'rgba(255,255,255,0.05)',
+                border: '1px solid rgba(255,255,255,0.08)',
+              }}
+            >
+              Re-plan
+            </button>
+          </div>
+        )}
 
         {/* Error */}
         {error && (
           <div
-            className="flex items-center gap-2 px-5 py-2.5 text-xs text-red-300"
-            style={{ background: 'rgba(239,68,68,0.08)', borderTop: '1px solid rgba(239,68,68,0.2)' }}
+            className="flex items-start gap-2 px-5 py-3 text-[12px] text-bad animate-fm-fade"
+            style={{
+              background: 'rgba(255,111,145,0.06)',
+              borderTop: '1px solid rgba(255,111,145,0.2)',
+            }}
           >
-            <svg viewBox="0 0 16 16" fill="currentColor" className="h-3.5 w-3.5 flex-none text-red-400">
-              <path d="M8 1a7 7 0 100 14A7 7 0 008 1zm0 4a.75.75 0 01.75.75v2.5a.75.75 0 01-1.5 0v-2.5A.75.75 0 018 5zm0 6a1 1 0 110-2 1 1 0 010 2z" />
-            </svg>
-            {error}
+            <IconAlert size={13} className="mt-[2px] flex-none" />
+            <span className="leading-snug">{error}</span>
           </div>
         )}
 
         {/* Recent commands */}
         {recentCommands.length > 0 && !loading && (
-          <div style={{ borderTop: '1px solid rgba(255,255,255,0.06)' }}>
-            <div className="px-5 pt-3 pb-1 text-[9px] font-semibold uppercase tracking-widest text-gray-600">
+          <div style={{ borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+            <div className="px-5 pt-3 pb-1 text-[9px] font-semibold uppercase tracking-micro text-fg-400">
               Recent
             </div>
-            <ul className="max-h-44 overflow-y-auto pb-2">
+            <ul className="max-h-56 overflow-y-auto pb-2">
               {recentCommands.slice(0, 5).map((cmd, i) => (
                 <li key={`${cmd}-${i}`}>
                   <button
+                    type="button"
                     onClick={() => onSubmit?.(cmd)}
-                    className="group flex w-full items-center gap-3 px-5 py-2 text-left text-sm text-gray-400 transition-all duration-100"
-                    onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(124,58,237,0.08)'; (e.currentTarget as HTMLElement).style.color = '#c4b5fd'; }}
-                    onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; (e.currentTarget as HTMLElement).style.color = ''; }}
+                    className="group flex w-full items-center gap-3 px-5 py-2 text-left text-[13px] text-fg-200 transition-colors duration-150"
+                    onMouseEnter={(e) => {
+                      const el = e.currentTarget as HTMLElement;
+                      el.style.background = 'rgba(124,92,255,0.06)';
+                      el.style.color = '#E8E9F2';
+                    }}
+                    onMouseLeave={(e) => {
+                      const el = e.currentTarget as HTMLElement;
+                      el.style.background = 'transparent';
+                      el.style.color = '';
+                    }}
                   >
-                    <svg viewBox="0 0 16 16" fill="none" className="h-3.5 w-3.5 flex-none text-gray-700 transition-colors group-hover:text-violet-400" stroke="currentColor" strokeWidth="1.5">
-                      <path d="M3 8h10M9 4l4 4-4 4" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
+                    <IconArrow
+                      size={12}
+                      className="flex-none text-fg-400 transition-colors duration-150 group-hover:text-accent-400"
+                    />
                     <span className="truncate">{cmd}</span>
                   </button>
                 </li>
@@ -173,15 +276,23 @@ export function IntentBox({
           </div>
         )}
 
-        {/* Bottom tip */}
+        {/* Bottom strip */}
         <div
-          className="flex items-center justify-between px-5 py-2"
-          style={{ borderTop: '1px solid rgba(255,255,255,0.04)', background: 'rgba(0,0,0,0.2)' }}
+          className="flex items-center justify-between px-5 py-2.5"
+          style={{
+            borderTop: '1px solid rgba(255,255,255,0.04)',
+            background: 'rgba(0,0,0,0.2)',
+          }}
         >
-          <span className="text-[10px] text-gray-700">FlowMind Autonomous Agent</span>
-          <span className="text-[10px] text-gray-700">
-            <kbd className="rounded px-1 py-0.5 text-[9px]" style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)' }}>Esc</kbd>
-            {' '}to close
+          <span className="text-[10px] uppercase tracking-micro text-fg-400">
+            FlowMind · Operating Layer
+          </span>
+          <span className="flex items-center gap-2 text-[10px] text-fg-300">
+            <Kbd>↵</Kbd>
+            <span className="text-fg-400">run</span>
+            <span className="text-fg-500">·</span>
+            <Kbd>Esc</Kbd>
+            <span className="text-fg-400">close</span>
           </span>
         </div>
       </div>
@@ -189,18 +300,31 @@ export function IntentBox({
   );
 }
 
+function Kbd({ children }: { children: React.ReactNode }) {
+  return (
+    <kbd
+      className="rounded-[4px] px-1.5 py-[1px] font-mono text-[9px] text-fg-200"
+      style={{
+        background: 'rgba(255,255,255,0.05)',
+        border: '1px solid rgba(255,255,255,0.08)',
+        boxShadow: 'inset 0 -1px 0 0 rgba(0,0,0,0.4)',
+      }}
+    >
+      {children}
+    </kbd>
+  );
+}
+
 function Spinner() {
   return (
-    <div className="relative flex-none">
+    <span
+      className="inline-flex h-5 w-5 flex-none items-center justify-center"
+      aria-label="Loading"
+    >
       <span
-        className="inline-block h-5 w-5 rounded-full border-2 border-violet-400 border-t-transparent"
-        style={{ animation: 'spin 0.8s linear infinite' }}
-        aria-label="Loading"
+        className="block h-4 w-4 rounded-full border-[1.5px] border-accent-400 border-t-transparent"
+        style={{ animation: 'spin 0.9s linear infinite' }}
       />
-      <span
-        className="absolute inset-0 rounded-full"
-        style={{ background: 'rgba(124,58,237,0.1)', animation: 'pulse 1s ease-in-out infinite' }}
-      />
-    </div>
+    </span>
   );
 }

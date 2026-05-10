@@ -1,7 +1,13 @@
 import type { AgentAction } from '../types';
+import { LowConfidenceError } from '../types';
+import type { Affordance } from '../perception/types';
+import { getLastSnapshot } from './dom-analyzer';
+import { buildPageModel } from '../perception/snapshot';
 
 const DEFAULT_WAIT_MS = 8000;
 const POLL_MS = 100;
+const MAX_LOCAL_RETRIES = 3;
+const LOW_CONFIDENCE_FLOOR = 0.25;
 
 export interface RunActionResult {
   /** Selector that was actually resolved at runtime (for UI highlight). */
@@ -43,11 +49,19 @@ export async function runAction(action: AgentAction): Promise<RunActionResult> {
 
 async function doPressKey(action: AgentAction): Promise<RunActionResult> {
   const key = (action.value || 'Enter').trim();
-  const target =
-    (action.selector || action.target_text)
-      ? await resolveElement({ ...action, action: 'type' }).catch(() => null)
-      : null;
-  const el = (target as HTMLElement | null) ?? (document.activeElement as HTMLElement | null) ?? document.body;
+  // press_key may target a typed input OR fire on whatever has focus.
+  // Try perception-driven resolve only when the action names a target.
+  let target: HTMLElement | null = null;
+  if (action.selector || action.target_text) {
+    try {
+      const attempted = new Set<string>();
+      const { el } = await resolveWithFallback({ ...action, action: 'type' }, attempted);
+      target = el as HTMLElement;
+    } catch {
+      target = null;
+    }
+  }
+  const el = target ?? (document.activeElement as HTMLElement | null) ?? document.body;
 
   const initBase: KeyboardEventInit = { key, bubbles: true, cancelable: true, composed: true };
   const init: KeyboardEventInit = key.length === 1
@@ -137,29 +151,30 @@ function findNearbySearchSubmit(input: HTMLElement): HTMLElement | null {
 /* ─── click ─────────────────────────────────────────────────────── */
 
 async function doClick(action: AgentAction): Promise<RunActionResult> {
-  const el = await resolveElement(action);
-  await scrollIntoView(el);
-  await sleep(60);
-  const before = location.href;
-  fireMouseSequence(el);
-  // Give the SPA router time to respond (YouTube intercepts anchor clicks).
-  await sleep(300);
-  const navigated = location.href !== before;
+  return withFallback(action, async (el) => {
+    await scrollIntoView(el);
+    await sleep(60);
+    const before = location.href;
+    fireMouseSequence(el);
+    // Give the SPA router time to respond (YouTube intercepts anchor clicks).
+    await sleep(300);
+    const navigated = location.href !== before;
 
-  // Fallback: if no navigation happened and the element is an anchor with href,
-  // drive the navigation ourselves. This reliably handles YouTube's custom-element
-  // shadow DOM where synthetic mouse events may not reach the router.
-  if (!navigated && el instanceof HTMLAnchorElement) {
-    const href = el.getAttribute('href');
-    if (href) {
-      const absolute = href.startsWith('http') ? href : location.origin + href;
-      location.assign(absolute);
-      await sleep(100);
-      return { resolved_selector: describe(el), navigated: true };
+    // Fallback: if no navigation happened and the element is an anchor with href,
+    // drive the navigation ourselves. This reliably handles YouTube's custom-element
+    // shadow DOM where synthetic mouse events may not reach the router.
+    if (!navigated && el instanceof HTMLAnchorElement) {
+      const href = el.getAttribute('href');
+      if (href) {
+        const absolute = href.startsWith('http') ? href : location.origin + href;
+        location.assign(absolute);
+        await sleep(100);
+        return { resolved_selector: describe(el), navigated: true };
+      }
     }
-  }
 
-  return { resolved_selector: describe(el), navigated };
+    return { resolved_selector: describe(el), navigated };
+  });
 }
 
 /* ─── click_result (deterministic, no LLM selector) ───────────── */
@@ -354,42 +369,43 @@ function isLinkVisible(el: HTMLElement): boolean {
 
 
 async function doType(action: AgentAction): Promise<RunActionResult> {
-  const el = await resolveElement(action);
-  await scrollIntoView(el);
-  const value = action.value ?? '';
+  return withFallback(action, async (el) => {
+    await scrollIntoView(el);
+    const value = action.value ?? '';
 
-  if (
-    el instanceof HTMLInputElement ||
-    el instanceof HTMLTextAreaElement
-  ) {
-    el.focus();
-    setNativeValue(el, '');
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    setNativeValue(el, value);
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    if (action.value?.endsWith('\n')) {
-      el.dispatchEvent(
-        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }),
-      );
+    if (
+      el instanceof HTMLInputElement ||
+      el instanceof HTMLTextAreaElement
+    ) {
+      el.focus();
+      setNativeValue(el, '');
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      setNativeValue(el, value);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      if (action.value?.endsWith('\n')) {
+        el.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }),
+        );
+      }
+      return { resolved_selector: describe(el) };
+    }
+
+    if (el instanceof HTMLElement && el.isContentEditable) {
+      el.focus();
+      el.textContent = value;
+      el.dispatchEvent(new InputEvent('input', { bubbles: true }));
+      return { resolved_selector: describe(el) };
+    }
+
+    // Fallback: synthesize keystrokes on whatever was found
+    if (el instanceof HTMLElement) {
+      el.focus();
+      el.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: value }));
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, data: value }));
     }
     return { resolved_selector: describe(el) };
-  }
-
-  if (el instanceof HTMLElement && el.isContentEditable) {
-    el.focus();
-    el.textContent = value;
-    el.dispatchEvent(new InputEvent('input', { bubbles: true }));
-    return { resolved_selector: describe(el) };
-  }
-
-  // Fallback: synthesize keystrokes on whatever was found
-  if (el instanceof HTMLElement) {
-    el.focus();
-    el.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: value }));
-    el.dispatchEvent(new InputEvent('input', { bubbles: true, data: value }));
-  }
-  return { resolved_selector: describe(el) };
+  });
 }
 
 /* ─── scroll ────────────────────────────────────────────────────── */
@@ -424,9 +440,10 @@ function normalizeUrl(url: string): string {
 /* ─── extract ───────────────────────────────────────────────────── */
 
 async function doExtract(action: AgentAction): Promise<RunActionResult> {
-  const el = await resolveElement(action);
-  const text = (el.textContent || '').trim();
-  return { resolved_selector: describe(el), extracted: text };
+  return withFallback(action, async (el) => {
+    const text = (el.textContent || '').trim();
+    return { resolved_selector: describe(el), extracted: text };
+  });
 }
 
 /* ─── wait ──────────────────────────────────────────────────────── */
@@ -454,6 +471,139 @@ async function doSwitchTab(action: AgentAction): Promise<RunActionResult> {
   if (!pattern) throw new Error('switch_tab requires value or selector pattern.');
   await chrome.runtime.sendMessage({ type: 'TAB_SWITCH', urlPattern: pattern });
   return {};
+}
+
+/* ─── perception-driven fallback retry ─────────────────────────── */
+
+/**
+ * Resolve an element for the given action. On failure, consults the cached
+ * PageModel for the next-best Affordance ranked by affinity × confidence ×
+ * salience. Throws LowConfidenceError when no remaining candidate clears
+ * the floor — caller should re-think via Gemini rather than retry locally.
+ *
+ * `attempted` accumulates selectors the caller has already tried so we don't
+ * loop on the same broken candidate.
+ */
+async function resolveWithFallback(
+  action: AgentAction,
+  attempted: Set<string>,
+): Promise<{ el: Element; affordance?: Affordance }> {
+  // First pass: existing resolver (selector → text → input fallbacks).
+  if (!action.selector || !attempted.has(action.selector)) {
+    try {
+      const el = await resolveElement(action);
+      if (action.selector) attempted.add(action.selector);
+      return { el };
+    } catch (err) {
+      if (action.selector) attempted.add(action.selector);
+      // Fall through to perception-driven alternates.
+      void err;
+    }
+  }
+
+  // Second pass: rank remaining affordances from the live PageModel.
+  const snap = getLastSnapshot();
+  let pageModel = snap?.page_model;
+  if (!pageModel) {
+    try {
+      pageModel = buildPageModel();
+    } catch {
+      pageModel = undefined;
+    }
+  }
+
+  const affordances = pageModel?.affordances ?? [];
+  const ranked = affordances
+    .filter((a) => a.selector && !attempted.has(a.selector))
+    .map((a) => ({ aff: a, score: affinity(action, a) * a.confidence * a.salience }))
+    .filter((c) => c.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  for (const { aff, score } of ranked) {
+    if (score < LOW_CONFIDENCE_FLOOR) {
+      throw new LowConfidenceError(
+        `No remaining affordance above confidence floor (${score.toFixed(2)} < ${LOW_CONFIDENCE_FLOOR}) for ${action.action}`,
+      );
+    }
+    attempted.add(aff.selector);
+    const el = trySelector(aff.selector, (n) =>
+      isInteractable(n) && matchesActionKind(n, action.action),
+    );
+    if (el) return { el, affordance: aff };
+  }
+
+  throw new Error(
+    `resolveWithFallback: exhausted ${ranked.length} alternate(s) for ${action.action} (selector=${action.selector ?? '∅'} text=${action.target_text ?? '∅'})`,
+  );
+}
+
+/**
+ * Map an action onto how well a given affordance can satisfy it.
+ * 0 means "not a candidate"; >0 is multiplied with confidence × salience.
+ */
+function affinity(action: AgentAction, aff: Affordance): number {
+  const text = (action.target_text ?? '').trim().toLowerCase();
+  const role = (action.target_role ?? '').trim().toLowerCase();
+  const label = (aff.label ?? '').toLowerCase();
+  const hint = (aff.hint ?? '').toLowerCase();
+
+  const roleBonus = role && (aff.aria_role === role || aff.tag === role) ? 0.4 : 0;
+  const textBonus = text && (label.includes(text) || hint.includes(text)) ? 0.4 : 0;
+  const exactBonus = text && label === text ? 0.3 : 0;
+
+  let kindFit = 0;
+  switch (action.action) {
+    case 'type':
+      if (aff.role === 'search_input' || aff.role === 'form_field') kindFit = 1.0;
+      else if (aff.tag === 'input' || aff.tag === 'textarea') kindFit = 0.8;
+      else if (aff.aria_role === 'textbox' || aff.aria_role === 'combobox') kindFit = 0.7;
+      break;
+    case 'click':
+    case 'press_key':
+      if (aff.role === 'primary_cta' || aff.role === 'submit') kindFit = 1.0;
+      else if (aff.role === 'result_link' || aff.role === 'media_tile') kindFit = 0.9;
+      else if (aff.role === 'secondary_cta' || aff.role === 'nav_link') kindFit = 0.6;
+      else if (aff.tag === 'a' || aff.tag === 'button') kindFit = 0.5;
+      break;
+    case 'extract':
+      kindFit = 0.4 + (text ? textBonus : 0);
+      break;
+    default:
+      kindFit = 0.3;
+  }
+
+  if (kindFit === 0 && !text) return 0;
+  return kindFit + roleBonus + textBonus + exactBonus;
+}
+
+/**
+ * Wrap an action body so it retries up to MAX_LOCAL_RETRIES times against
+ * perception-ranked alternates before bubbling. Result.resolved_selector is
+ * overridden with the affordance selector when a fallback was used.
+ */
+async function withFallback(
+  action: AgentAction,
+  fn: (el: Element) => Promise<RunActionResult>,
+): Promise<RunActionResult> {
+  const attempted = new Set<string>();
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= MAX_LOCAL_RETRIES; attempt++) {
+    try {
+      const { el, affordance } = await resolveWithFallback(action, attempted);
+      const result = await fn(el);
+      if (affordance && !result.resolved_selector) {
+        return { ...result, resolved_selector: affordance.selector };
+      }
+      return result;
+    } catch (err) {
+      lastErr = err;
+      if (err instanceof LowConfidenceError) throw err;
+      // Otherwise continue with next alternate.
+    }
+  }
+  throw lastErr instanceof Error
+    ? lastErr
+    : new Error(`Action ${action.action} exhausted local retries`);
 }
 
 /* ─── element resolution ────────────────────────────────────────── */

@@ -73,6 +73,11 @@ export interface DOMSnapshot {
    * cap truncated them.
    */
   media_links?: { title: string; href: string; selector: string }[];
+  /**
+   * Action-centric semantic model produced by the perception engine.
+   * Imported lazily to avoid a cycle with the types module.
+   */
+  page_model?: import('../perception/types').PageModel;
 }
 
 export interface UserProfile {
@@ -87,13 +92,67 @@ export interface UserProfile {
   custom_instructions: string;
 }
 
+export interface WorkflowRun {
+  ts: number;
+  outcome: 'success' | 'partial' | 'failed';
+  failed_step?: number;
+  reason?: string;
+  duration_ms: number;
+}
+
 export interface WorkflowMemory {
   id: string;
   trigger: string;
+  /** Alternative phrasings the user has used for this workflow. */
+  pattern: string[];
   domain: string;
   actions: AgentAction[];
-  run_count: number;
+  /** Schema version — bump when shape changes so loaders can migrate. */
+  version: number;
+  created_at: number;
   last_run: number;
+  run_count: number;
+  /** Rolling success rate across the last 10 runs (0..1). */
+  success_rate: number;
+  /** Recent failure reasons, deduped, capped at 5. */
+  failure_reasons: string[];
+  /** Inferred preferences (stable values) keyed by selector. */
+  preferences: Record<string, string>;
+  /** Per-run history, capped at 20 newest. */
+  history: WorkflowRun[];
+  last_outcome?: WorkflowRun['outcome'];
+}
+
+/** Result of perception-driven element resolution. */
+export interface ResolvedAction {
+  affordance_id?: string;
+  selector: string;
+}
+
+export type ExecutorMode = 'agentic' | 'replay';
+
+export interface ExecutorRunOptions {
+  mode?: ExecutorMode;
+  workflow?: WorkflowMemory;
+}
+
+export interface SnapshotCacheEntry {
+  key: string;
+  snapshot: DOMSnapshot;
+  ts: number;
+}
+
+/**
+ * Thrown when perception has no remaining alternates above the
+ * confidence threshold — the executor should re-think via Gemini
+ * rather than burn more local retries.
+ */
+export class LowConfidenceError extends Error {
+  readonly kind = 'low_confidence' as const;
+  constructor(message: string) {
+    super(message);
+    this.name = 'LowConfidenceError';
+  }
 }
 
 export interface AgentEvent {

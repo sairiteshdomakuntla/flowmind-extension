@@ -67,7 +67,6 @@ function buildPrompt(
   history: StepRecord[] = [],
 ): string {
   const profileContext = profileToContext(profile);
-  const domJson = JSON.stringify(dom, null, 2);
   const historyBlock = history.length
     ? `=== STEPS ALREADY EXECUTED (most recent last) ===
 ${history
@@ -82,13 +81,17 @@ ${history
 
 `
     : '';
-  const mediaLinksBlock = dom.media_links && dom.media_links.length > 0
+  const resultRich = (dom.page_model?.role_counts?.result_link ?? 0) >= 5;
+  const mediaLinksBlock = !resultRich && dom.media_links && dom.media_links.length > 0
     ? `=== CONTENT/VIDEO LINKS ON THIS PAGE (media_links) ===
 Use these verbatim when you need to click a result. Prefer media_links[0] for the first result.
 ${dom.media_links.map((ml, i) => `[${i}] title="${ml.title}" selector="${ml.selector}" href="${ml.href}"`).join('\n')}
 
 `
     : '';
+
+  const perceptionBlock = renderPerception(dom);
+  const rawElementsBlock = renderInteractiveElementsCompact(dom);
 
   return `${AGENT_SYSTEM_PROMPT}
 
@@ -99,13 +102,95 @@ ${historyBlock}${mediaLinksBlock}=== CURRENT PAGE ===
 URL: ${dom.url}
 Title: ${dom.title}
 
-DOM Snapshot:
-${domJson}
+${perceptionBlock}${rawElementsBlock}
 
 === USER INTENT ===
 ${intent}
 
-Decide the NEXT 1–3 steps based on what is on screen RIGHT NOW. If the user's intent is fully satisfied, return goal_complete: true with a single "finish" step. Respond with JSON only.`;
+Decide the NEXT 1–3 steps based on the PAGE MODEL above and the user intent.
+Prefer affordances from the model — they are deduplicated, ranked, and labeled.
+The raw RAW_ELEMENTS list is a fallback when no affordance fits. If the page is
+blocked_by_overlay=true, your first step MUST clear the overlay.
+If the user's intent is fully satisfied, return goal_complete: true with a single
+"finish" step. Respond with JSON only.`;
+}
+
+function renderPerception(dom: DOMSnapshot): string {
+  const m = dom.page_model;
+  if (!m) return '';
+  const aff = m.affordances
+    .map((a) => {
+      const flags: string[] = [];
+      if (a.in_viewport) flags.push('viewport');
+      if (a.id === m.primary_action_id) flags.push('PRIMARY');
+      const flagStr = flags.length ? ` [${flags.join(',')}]` : '';
+      const href = a.href ? ` href="${truncate(a.href, 60)}"` : '';
+      const itype = a.input_type ? ` type=${a.input_type}` : '';
+      const region = a.region && a.region !== 'unknown' ? ` region=${a.region}` : '';
+      return `- id=${a.id} role=${a.role} sal=${a.salience} conf=${a.confidence}${flagStr}
+  label="${truncate(a.label, 80)}"${itype}${region}${href}
+  selector=${a.selector}`;
+    })
+    .join('\n');
+
+  const counts = Object.entries(m.role_counts)
+    .map(([role, n]) => `${role}=${n}`)
+    .join(' ');
+
+  const next = m.suggested_next_steps.length
+    ? m.suggested_next_steps.map((s) => `  • ${s}`).join('\n')
+    : '  (none)';
+
+  return `=== PAGE MODEL (perception engine) ===
+archetype: ${m.archetype}
+workflow_phase: ${m.workflow_phase}
+summary: ${m.summary}
+primary_action_id: ${m.primary_action_id ?? '∅'}
+blocked_by_overlay: ${m.blocked_by_overlay}
+depth: ${m.depth}
+role_counts: ${counts}
+suggested_next_steps:
+${next}
+
+affordances (ranked by salience):
+${aff || '(none)'}
+
+`;
+}
+
+function renderInteractiveElementsCompact(dom: DOMSnapshot): string {
+  // When perception is present, we keep the raw list as a fallback but
+  // compress it heavily — one line per element, no JSON, capped to ~40.
+  if (!dom.page_model) {
+    return `\n=== RAW DOM SNAPSHOT ===\n${JSON.stringify(dom, null, 2)}\n`;
+  }
+  // When the page is rich in affordances, the raw list is mostly noise.
+  const dense = (dom.page_model.affordances?.length ?? 0) >= 8;
+  const cap = dense ? 30 : 40;
+  const els = dom.interactive_elements.slice(0, cap);
+  const lines = els.map((e) => {
+    const parts: string[] = [];
+    parts.push(e.tag);
+    if (e.type) parts.push(`type=${e.type}`);
+    if (e.id) parts.push(`id=${e.id}`);
+    if (e.role) parts.push(`role=${e.role}`);
+    if (e.aria_label) parts.push(`aria="${truncate(e.aria_label, 40)}"`);
+    if (e.text) parts.push(`text="${truncate(e.text, 40)}"`);
+    if (e.placeholder) parts.push(`ph="${truncate(e.placeholder, 30)}"`);
+    parts.push(`sel=${e.selector}`);
+    return `- ${parts.join(' ')}`;
+  });
+  const summaryLimit = dom.page_model.summary ? 800 : 2000;
+  return `=== RAW_ELEMENTS (fallback only) ===
+${lines.join('\n')}
+${dom.interactive_elements.length > cap ? `… (${dom.interactive_elements.length - cap} more truncated)` : ''}
+PAGE_TEXT: ${truncate(dom.page_text_summary, summaryLimit)}
+`;
+}
+
+function truncate(s: string, n: number): string {
+  if (!s) return '';
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
 }
 
 function extractJson(text: string): string {

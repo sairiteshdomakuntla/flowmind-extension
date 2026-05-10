@@ -74,12 +74,14 @@ export function ActionHighlight({ selector }: ActionHighlightProps) {
   return (
     <div
       data-flowmind-highlight={selector}
-      className="pointer-events-none fixed z-[2147483646] animate-pulse rounded-md ring-2 ring-blue-400 ring-offset-2 ring-offset-transparent shadow-[0_0_20px_4px_rgba(96,165,250,0.65)] transition-all duration-150"
+      className="pointer-events-none fixed z-[2147483646] rounded-[6px] transition-all duration-150"
       style={{
         top: `${rect.top}px`,
         left: `${rect.left}px`,
         width: `${rect.width}px`,
         height: `${rect.height}px`,
+        boxShadow:
+          '0 0 0 1.5px rgba(124,92,255,0.85), 0 0 0 6px rgba(124,92,255,0.12), 0 0 24px rgba(79,163,255,0.25)',
       }}
     />
   );

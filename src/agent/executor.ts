@@ -3,13 +3,19 @@ import type {
   AgentEvent,
   ExecutionPlan,
   ExecutionResult,
+  ExecutorMode,
   PendingPlan,
   StepRecord,
+  WorkflowMemory,
+  WorkflowRun,
 } from '../types';
+import { LowConfidenceError } from '../types';
 import { analyzeDom } from './dom-analyzer';
 import { generateExecutionPlan } from './gemini-client';
 import { runAction } from './action-runner';
 import { loadProfile } from '../context/user-profile';
+import { recordRun } from '../memory/workflow-store';
+import type { DOMSnapshot } from '../types';
 
 const STEP_GAP_MS = 600;
 const PENDING_PLAN_KEY = 'flowmind_pending_plan';
@@ -27,7 +33,25 @@ interface RunState {
   completedSteps: number;
   failedSteps: number;
   errors: string[];
+  startedAt: number;
+  matchedWorkflowId?: string;
+  mode: ExecutorMode;
+  workflow?: WorkflowMemory;
+  /** Index of the next replay action to feed into runBatch. */
+  replayCursor: number;
+  /** Bumps when a replay step failed via fallback — second failure escalates. */
+  replayFailures: number;
 }
+
+export interface RunOptions {
+  /** When set, the run's outcome is appended to this workflow's history. */
+  workflow?: WorkflowMemory;
+  /** "replay" feeds the workflow's recorded actions directly, skipping Gemini. */
+  mode?: ExecutorMode;
+}
+
+const REPLAY_CHUNK = 3;
+const MAX_REPLAY_FALLBACK_FAILS = 1;
 
 export class Executor extends EventTarget {
   private paused = false;
@@ -115,13 +139,16 @@ export class Executor extends EventTarget {
   }
 
   /** Plan + run iteratively until goal_complete or max iterations. */
-  async run(intent: string): Promise<ExecutionResult> {
+  async run(intent: string, opts: RunOptions = {}): Promise<ExecutionResult> {
     if (this.running) return failResult('Executor is already running.');
 
     this.running = true;
     this.paused = false;
     this.stopped = false;
     this.abortCtrl = new AbortController();
+
+    const mode: ExecutorMode =
+      opts.mode === 'replay' && opts.workflow ? 'replay' : 'agentic';
 
     const state: RunState = {
       intent,
@@ -131,6 +158,12 @@ export class Executor extends EventTarget {
       completedSteps: 0,
       failedSteps: 0,
       errors: [],
+      startedAt: Date.now(),
+      matchedWorkflowId: opts.workflow?.id,
+      mode,
+      workflow: opts.workflow,
+      replayCursor: 0,
+      replayFailures: 0,
     };
 
     return await this.runLoop(state);
@@ -153,6 +186,10 @@ export class Executor extends EventTarget {
       completedSteps: history.filter((h) => h.ok).length,
       failedSteps: history.filter((h) => !h.ok).length,
       errors: history.filter((h) => !h.ok).map((h) => h.error || 'unknown'),
+      startedAt: Date.now(),
+      mode: 'agentic',
+      replayCursor: 0,
+      replayFailures: 0,
     };
 
     this.emit({
@@ -174,11 +211,82 @@ export class Executor extends EventTarget {
         await this.waitWhilePaused();
         this.throwIfStopped();
 
+        // ── Replay path: feed recorded actions directly, no Gemini call.
+        if (state.mode === 'replay' && state.workflow) {
+          const all = state.workflow.actions;
+          if (state.replayCursor >= all.length) {
+            goalComplete = true;
+            break;
+          }
+          if (!firstPlanEmitted) {
+            firstPlanEmitted = true;
+            state.goal = state.workflow.trigger || state.intent;
+            this.emit({
+              type: 'plan_ready',
+              message: state.goal,
+              total_steps: all.length,
+            });
+            this.emit({ type: 'log', message: `▶ Replaying recorded workflow (${all.length} steps)` });
+          }
+          const slice = all.slice(state.replayCursor, state.replayCursor + REPLAY_CHUNK);
+          const beforeFailed = state.failedSteps;
+          const navigated = await this.runBatch(state, slice);
+          const stepsConsumed = state.failedSteps > beforeFailed ? slice.length - 1 : slice.length;
+          state.replayCursor += Math.max(stepsConsumed, 0);
+          iteration += 1;
+
+          if (state.failedSteps > beforeFailed) {
+            // Stage 1 fallback already tried perception alternates. Escalate
+            // to agentic mode after one such failure so Gemini can re-plan
+            // from the current page state, preserving prior history.
+            state.replayFailures += 1;
+            if (state.replayFailures > MAX_REPLAY_FALLBACK_FAILS) {
+              this.emit({
+                type: 'log',
+                message: '⚠ Replay step failed — escalating to live planning.',
+              });
+              state.mode = 'agentic';
+              firstPlanEmitted = false; // re-emit a fresh plan_ready for the agentic phase
+              continue;
+            }
+          }
+
+          if (navigated) {
+            await this.sleep(2000);
+            this.emit({ type: 'log', message: 'Replay continuing after navigation…' });
+          }
+          continue;
+        }
+
         // 1. Observe — fresh DOM snapshot.
         await this.sleep(150);
         this.throwIfStopped();
         const dom = analyzeDom();
         const profile = await loadProfile();
+
+        // 1b. Fast path — if perception's primary action is unambiguous and
+        // matches the user's intent, run it without burning a Gemini call.
+        const fast = tryFastNextStep(dom, state);
+        if (fast) {
+          if (!firstPlanEmitted) {
+            firstPlanEmitted = true;
+            this.emit({
+              type: 'plan_ready',
+              message: state.goal,
+              total_steps: 1,
+            });
+          }
+          this.emit({
+            type: 'log',
+            message: `⚡ skipped think (fast path) → ${fast.description}`,
+          });
+          const navigated = await this.runBatch(state, [fast]);
+          if (navigated) {
+            await this.sleep(2000);
+          }
+          // Fast steps don't burn the iteration budget — they're free.
+          continue;
+        }
 
         // 2. Think — ask Gemini for next batch.
         let plan: ExecutionPlan;
@@ -205,6 +313,7 @@ export class Executor extends EventTarget {
           this.emit({ type: 'done', result, message: result.summary });
           this.running = false;
           await clearPendingPlan();
+          await this.recordWorkflowOutcome(state, 'failed', msg);
           return result;
         }
 
@@ -291,6 +400,16 @@ export class Executor extends EventTarget {
         this.emit({ type: 'done', result, message: result.summary });
       }
       this.running = false;
+      const outcome: WorkflowRun['outcome'] = result.success
+        ? 'success'
+        : state.completedSteps > 0
+          ? 'partial'
+          : 'failed';
+      await this.recordWorkflowOutcome(
+        state,
+        outcome,
+        result.success ? undefined : state.errors[state.errors.length - 1],
+      );
       return result;
     } catch (err) {
       // StopSignal is not an error — it's an expected interruption.
@@ -316,7 +435,28 @@ export class Executor extends EventTarget {
       await clearPendingPlan();
       this.emit({ type: 'done', result, message: result.summary });
       this.running = false;
+      await this.recordWorkflowOutcome(state, 'failed', msg);
       return result;
+    }
+  }
+
+  private async recordWorkflowOutcome(
+    state: RunState,
+    outcome: WorkflowRun['outcome'],
+    reason?: string,
+  ): Promise<void> {
+    if (!state.matchedWorkflowId) return;
+    try {
+      const lastFailIdx = state.history.findIndex((h) => !h.ok);
+      await recordRun(state.matchedWorkflowId, {
+        ts: Date.now(),
+        outcome,
+        failed_step: lastFailIdx >= 0 ? lastFailIdx : undefined,
+        reason,
+        duration_ms: Date.now() - state.startedAt,
+      });
+    } catch (err) {
+      console.warn('[FlowMind] recordRun failed:', err);
     }
   }
 
@@ -404,6 +544,11 @@ export class Executor extends EventTarget {
     } catch (firstErr) {
       if (firstErr instanceof StopSignal) throw firstErr;
       if (this.stopped) throw new StopSignal();
+      // Perception-driven fallback already exhausted local alternates —
+      // short-circuit so Gemini gets explicit failure context next loop.
+      if (firstErr instanceof LowConfidenceError) {
+        return { error: `LOW_CONFIDENCE: ${firstErr.message}` };
+      }
       const firstMessage = (firstErr as Error).message;
       await this.sleep(400);
       if (this.stopped) throw new StopSignal();
@@ -418,6 +563,9 @@ export class Executor extends EventTarget {
       } catch (secondErr) {
         if (secondErr instanceof StopSignal) throw secondErr;
         if (this.stopped) throw new StopSignal();
+        if (secondErr instanceof LowConfidenceError) {
+          return { error: `LOW_CONFIDENCE: ${secondErr.message}` };
+        }
         const secondMessage = (secondErr as Error).message;
         return { error: `${firstMessage} | retry: ${secondMessage}` };
       }
@@ -428,6 +576,73 @@ export class Executor extends EventTarget {
 /** Sentinel thrown when the user presses Stop. Not an error. */
 class StopSignal {
   readonly message = 'Stopped by user.';
+}
+
+const FAST_PATH_FLOOR = 0.7;
+const STOPWORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'to', 'for', 'of', 'in', 'on', 'with', 'by',
+  'is', 'are', 'be', 'this', 'that', 'it', 'find', 'show', 'me', 'please',
+  'click', 'open', 'go', 'visit', 'search', 'type', 'enter', 'select', 'pick',
+  'get', 'fetch', 'i', 'want', 'need',
+]);
+
+function nouns(s: string): Set<string> {
+  return new Set(
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9 ]+/g, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length >= 3 && !STOPWORDS.has(w)),
+  );
+}
+
+/**
+ * Returns a single-step action when perception is confident enough that we
+ * don't need to ask Gemini. Only fires when:
+ *   • PageModel exposes a primary_action_id
+ *   • The matching affordance has confidence × salience ≥ 0.7
+ *   • The user's goal text shares ≥1 noun with the affordance label
+ *   • The same affordance hasn't already failed in this run
+ */
+function tryFastNextStep(dom: DOMSnapshot, state: RunState): AgentAction | null {
+  if (state.mode === 'replay') return null;
+  const m = dom.page_model;
+  if (!m || !m.primary_action_id) return null;
+  const aff = m.affordances.find((a) => a.id === m.primary_action_id);
+  if (!aff) return null;
+
+  const score = aff.confidence * aff.salience;
+  if (score < FAST_PATH_FLOOR) return null;
+
+  const goalNouns = nouns(state.goal || state.intent);
+  if (goalNouns.size === 0) return null;
+  const labelNouns = nouns(aff.label);
+  let overlap = 0;
+  for (const n of goalNouns) if (labelNouns.has(n)) overlap++;
+  if (overlap === 0) return null;
+
+  const failedHere = state.history.some(
+    (h) => !h.ok && (h.action.selector === aff.selector || h.action.target_text === aff.label),
+  );
+  if (failedHere) return null;
+
+  // Map affordance role → action.
+  const isInput =
+    aff.role === 'search_input' ||
+    aff.role === 'form_field' ||
+    aff.tag === 'input' ||
+    aff.tag === 'textarea' ||
+    aff.aria_role === 'textbox' ||
+    aff.aria_role === 'combobox';
+  if (isInput) return null; // typing needs a value the LLM has to compose.
+
+  return {
+    action: 'click',
+    selector: aff.selector,
+    target_text: aff.label,
+    target_role: aff.aria_role || aff.tag,
+    description: `Click "${aff.label.slice(0, 60)}"`,
+  };
 }
 
 function failResult(summary: string, errors: string[] = []): ExecutionResult {

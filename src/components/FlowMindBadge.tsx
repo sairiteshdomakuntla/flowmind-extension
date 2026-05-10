@@ -1,3 +1,5 @@
+import { FlowMark } from './brand/FlowMark';
+
 interface FlowMindBadgeProps {
   onClick: () => void;
   hidden?: boolean;
@@ -9,36 +11,32 @@ export function FlowMindBadge({ onClick, hidden }: FlowMindBadgeProps) {
     <button
       type="button"
       onClick={onClick}
-      title="Open FlowMind (Ctrl/Cmd+Shift+K)"
+      title="FlowMind  ·  ⌘⇧K"
       aria-label="Open FlowMind"
-      className="fixed bottom-5 right-5 z-[2147483646] flex h-11 w-11 items-center justify-center rounded-full transition-all duration-200"
+      className="group fixed bottom-5 right-5 z-[2147483646] flex h-10 w-10 items-center justify-center rounded-full transition-all duration-200"
       style={{
-        background: 'linear-gradient(135deg, #7c3aed, #4f46e5)',
-        boxShadow: '0 0 0 1px rgba(139,92,246,0.4), 0 4px 20px rgba(124,58,237,0.5), 0 0 0 0 rgba(124,58,237,0.3)',
+        background:
+          'linear-gradient(180deg, rgba(15,15,26,0.92) 0%, rgba(8,8,15,0.92) 100%)',
+        border: '1px solid rgba(255,255,255,0.08)',
+        boxShadow:
+          '0 8px 24px -8px rgba(0,0,0,0.6), 0 1px 0 0 rgba(255,255,255,0.06) inset',
+        backdropFilter: 'blur(12px)',
+        WebkitBackdropFilter: 'blur(12px)',
       }}
       onMouseEnter={(e) => {
         const el = e.currentTarget as HTMLElement;
-        el.style.transform = 'scale(1.1)';
-        el.style.boxShadow = '0 0 0 1px rgba(139,92,246,0.6), 0 4px 30px rgba(124,58,237,0.7), 0 0 20px rgba(124,58,237,0.4)';
+        el.style.borderColor = 'rgba(124,92,255,0.45)';
+        el.style.boxShadow =
+          '0 8px 24px -6px rgba(124,92,255,0.35), 0 1px 0 0 rgba(255,255,255,0.06) inset';
       }}
       onMouseLeave={(e) => {
         const el = e.currentTarget as HTMLElement;
-        el.style.transform = 'scale(1)';
-        el.style.boxShadow = '0 0 0 1px rgba(139,92,246,0.4), 0 4px 20px rgba(124,58,237,0.5), 0 0 0 0 rgba(124,58,237,0.3)';
-      }}
-      onMouseDown={(e) => {
-        (e.currentTarget as HTMLElement).style.transform = 'scale(0.95)';
-      }}
-      onMouseUp={(e) => {
-        (e.currentTarget as HTMLElement).style.transform = 'scale(1.1)';
+        el.style.borderColor = 'rgba(255,255,255,0.08)';
+        el.style.boxShadow =
+          '0 8px 24px -8px rgba(0,0,0,0.6), 0 1px 0 0 rgba(255,255,255,0.06) inset';
       }}
     >
-      {/* Icon: abstract flow/mind symbol */}
-      <svg viewBox="0 0 20 20" fill="none" className="h-5 w-5" stroke="white" strokeWidth="1.6">
-        <circle cx="10" cy="10" r="3.5" />
-        <path d="M10 2v2.5M10 15.5V18M2 10h2.5M15.5 10H18" strokeLinecap="round" />
-        <path d="M4.22 4.22l1.77 1.77M14.01 14.01l1.77 1.77M4.22 15.78l1.77-1.77M14.01 5.99l1.77-1.77" strokeLinecap="round" />
-      </svg>
+      <FlowMark size={18} />
     </button>
   );
 }

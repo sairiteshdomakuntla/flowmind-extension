@@ -27,7 +27,28 @@ export async function getUserProfile(): Promise<UserProfile | null> {
 
 export async function getWorkflows(): Promise<WorkflowMemory[]> {
   const result = await chrome.storage.local.get(WORKFLOWS_STORAGE_KEY);
-  return (result[WORKFLOWS_STORAGE_KEY] as WorkflowMemory[] | undefined) ?? [];
+  const raw = (result[WORKFLOWS_STORAGE_KEY] as Partial<WorkflowMemory>[] | undefined) ?? [];
+  // Migrate legacy entries (pre-v1 schema) without touching disk on every read.
+  return raw.map(migrateWorkflow);
+}
+
+function migrateWorkflow(w: Partial<WorkflowMemory>): WorkflowMemory {
+  return {
+    id: w.id ?? '',
+    trigger: w.trigger ?? '',
+    pattern: w.pattern ?? (w.trigger ? [w.trigger] : []),
+    domain: w.domain ?? '',
+    actions: w.actions ?? [],
+    version: w.version ?? 1,
+    created_at: w.created_at ?? w.last_run ?? Date.now(),
+    last_run: w.last_run ?? 0,
+    run_count: w.run_count ?? 0,
+    success_rate: w.success_rate ?? 0,
+    failure_reasons: w.failure_reasons ?? [],
+    preferences: w.preferences ?? {},
+    history: w.history ?? [],
+    last_outcome: w.last_outcome,
+  };
 }
 
 export async function saveWorkflow(workflow: WorkflowMemory): Promise<void> {

@@ -1,6 +1,22 @@
 import type { DOMSnapshot } from '../types';
+import { buildPageModel } from '../perception/snapshot';
+import { getCachedSnapshot, putCachedSnapshot } from './snapshot-cache';
 
 const PAGE_TEXT_LIMIT = 2000;
+
+let lastSnapshot: { snap: DOMSnapshot; ts: number } | null = null;
+const LAST_SNAPSHOT_TTL_MS = 6000;
+
+/**
+ * Returns the most recently produced DOMSnapshot (and its PageModel) if it is
+ * still fresh. Used by action-runner for perception-driven fallback retry
+ * without re-running the full analyzer.
+ */
+export function getLastSnapshot(): DOMSnapshot | null {
+  if (!lastSnapshot) return null;
+  if (Date.now() - lastSnapshot.ts > LAST_SNAPSHOT_TTL_MS) return null;
+  return lastSnapshot.snap;
+}
 const INTERACTIVE_SELECTOR =
   'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="combobox"], [contenteditable="true"], [id="video-title"], h3 a[href]';
 
@@ -123,6 +139,12 @@ export function analyzeDom(): DOMSnapshot {
     };
   }
 
+  const cached = getCachedSnapshot();
+  if (cached) {
+    lastSnapshot = { snap: cached, ts: Date.now() };
+    return cached;
+  }
+
   const elements = Array.from(document.querySelectorAll(INTERACTIVE_SELECTOR));
   const interactive_elements: DOMSnapshot['interactive_elements'] = [];
 
@@ -171,13 +193,26 @@ export function analyzeDom(): DOMSnapshot {
   // Extract media/video links separately so Gemini always sees them regardless of the cap.
   const media_links = extractMediaLinks();
 
-  return {
+  // Action-centric semantic model. The planner consumes this first; the raw
+  // interactive_elements list is kept as a low-noise fallback.
+  let page_model: DOMSnapshot['page_model'];
+  try {
+    page_model = buildPageModel();
+  } catch (err) {
+    console.warn('[FlowMind] perception failed:', err);
+  }
+
+  const snap: DOMSnapshot = {
     url: location.href,
     title: document.title,
     interactive_elements,
     page_text_summary: extractPageText(),
     media_links: media_links.length > 0 ? media_links : undefined,
+    page_model,
   };
+  lastSnapshot = { snap, ts: Date.now() };
+  putCachedSnapshot(snap);
+  return snap;
 }
 
 /**

@@ -20,7 +20,7 @@ export default defineManifest({
       run_at: 'document_idle',
     },
   ],
-  permissions: ['storage', 'tabs', 'scripting', 'activeTab'],
+  permissions: ['storage', 'tabs', 'scripting', 'activeTab', 'webNavigation', 'debugger'],
   host_permissions: ['<all_urls>'],
   commands: {
     'toggle-intent-box': {
